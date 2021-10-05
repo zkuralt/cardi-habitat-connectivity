@@ -1,0 +1,225 @@
+---
+title: "HSM & Habitat Connectivity"
+author: "Žan Kuralt"
+date: "`r Sys.Date()`"
+time: "`r Sys.time()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, error = FALSE, echo = FALSE)
+```
+
+```{r load packages, message=FALSE, warning=FALSE}
+library(raster)
+library(sf)
+library(grainscape)
+library(dplyr)
+library(ggplot2)
+library(ENMeval)
+library(spThin)
+library(rgeos)
+library(spatialEco)
+library(igraph)
+```
+
+
+Import occurrence data and plot it on map.
+```{r import data}
+telemtry_lynx <- read_sf("data/LYNX/LynxCROSLO1.shp")
+telemtry_wolf <- read_sf("data/WOLF/WolvesSLOCRO2.shp")
+telemtry_bear <- read_sf("data/BEAR/BearsSLOCRO1.shp")
+scats_lynx <- read_sf("data/LYNX/lynx_ngv.shp")
+scats_wolf <- read_sf("data/WOLF/wolf_ngv.shp")
+scats_bear <- read_sf("data/BEAR/dinalpbear/tocke_mbase.org.shp")
+slohr <- read_sf("temp/slohr_wgs84.shp")
+
+plot(st_geometry(slohr), axes = TRUE)
+plot(st_geometry(telemtry_lynx), pch = 1, col = "dark red", add = TRUE)
+plot(st_geometry(telemtry_wolf), pch = 1, col = "dark blue", add = TRUE)
+plot(st_geometry(telemtry_bear), pch = 1, col = "dark green", add = TRUE)
+plot(st_geometry(scats_lynx), pch = 1, col = "red", add = TRUE)
+plot(st_geometry(scats_wolf), pch = 1, col = "blue", add = TRUE)
+plot(st_geometry(scats_bear), pch = 1, col = "green", add = TRUE)
+
+```
+
+```{r tidy occurrence data}
+# combine telemetry and ngs data
+telemtry.lynx.coords <- st_coordinates(telemtry_lynx)
+telemtry.wolf.coords <- st_coordinates(telemtry_wolf)
+telemtry.bear.coords <- st_coordinates(telemtry_bear)
+ngs.lynx.coords <- st_coordinates(scats_lynx)
+ngs.wolf.coords <- st_coordinates(scats_wolf)
+ngs.bear.coords <- st_coordinates(scats_bear)
+
+# select species in question
+datapoints <- rbind(telemtry.lynx.coords, 
+                    # telemtry.wolf.coords, 
+                    # telemtry.bear.coords,
+                    ngs.lynx.coords) 
+                    # ngs.wolf.coords) 
+                    # ngs.bear.coords)
+
+
+# remove data with missing coordinates
+datapoints <- na.omit(datapoints)
+
+# remove duplicates
+dups <- duplicated(datapoints)
+datapoints <- datapoints[!dups, ]
+
+points <- st_as_sf(x = as.data.frame(datapoints), coords = c("X", "Y"))
+st_crs(points) <- 4326
+```
+
+Import covariates
+```{r import covars}
+fajls <- list.files("data/COVARIATES/500m/", full.names = TRUE)
+cvrs <- lapply(X = fajls, FUN = raster::raster)
+covars <- raster::stack(cvrs)
+plot(covars)
+```
+
+# Check for multicollinearity of covariates
+```{r check multicollinearity}
+names(covars)
+vif.calc <- as.data.frame(HH::vif(as.data.frame(covars)))
+vif.calc
+
+cov.cor <- cor(na.omit(as.data.frame(covars)))
+corrplot::corrplot(cov.cor, method = 'square', order = 'FPC', type = 'upper', diag = FALSE)
+covars <- covars[[rownames(vif.calc)[vif.calc < 4]]]
+
+HH::vif(as.data.frame(covars))
+cov.cor <- cor(na.omit(as.data.frame(covars)))
+corrplot::corrplot(cov.cor, method = 'square', order = 'FPC', type = 'upper', diag = FALSE)
+
+plot(covars)
+```
+
+# Thin occurrences
+```{r tidy occurrence data}
+points <- st_transform(points, 3035)
+
+# treat occurrences that fall in the same 500m cell of covariate dataset as one
+occ.rast <- rasterize(points, covars, value = 1, FUN = "first")
+occ.pnt <- rasterToPoints(occ.rast, spatial = TRUE)
+occ.pnt <- st_as_sf(occ.pnt)
+occ.pnt <- st_transform(occ.pnt, 4326)
+
+# create dataframe for spThin::thin() function
+occ.coords <- as.data.frame(st_coordinates(occ.pnt))
+occ.coords$species <- "spec"
+
+thinned <- thin(loc.data = occ.coords,
+                lat.col = "Y",
+                long.col = "X",
+                spec.col = "species",
+                reps = 1,
+                thin.par = 1,
+                locs.thinned.list.return = TRUE,
+                write.files = FALSE,
+                write.log.file = FALSE)
+
+# make thinned dataset a spatial object
+df <- st_as_sf(thinned[[1]], coords = c("Longitude", "Latitude"))
+st_crs(df) <- 4326
+
+# create interactive map of occurrences
+library(leaflet)
+df %>% 
+  leaflet() %>%
+  addTiles() %>%
+  addMarkers()
+
+# transform CRS and get it ready for modeling
+df <- st_transform(df, 3035)
+df <- sp::SpatialPoints(as_Spatial(df))
+```
+
+# Get background points
+```{r get background pts} 
+bg <- dismo::randomPoints(covars, n = 10000)
+bg <- as.data.frame(bg)
+```
+
+# Run model
+```{r HSM}
+occ <- coordinates(df)
+colnames(occ) <- c("x", "y")
+names(covars)
+mod <- ENMevaluate(occs = occ,
+                   envs = covars, 
+                   bg = bg, 
+                   partitions = "block", 
+                   algorithm = "maxnet", 
+                   categoricals = "clc2018_500m",
+                   tune.args = list(fc = c("L","LQ","LQH"), # Linear, Quadratic and Hinge features
+                                    rm = seq(from = 1, to = 5, by = 0.5)), 
+                   doClamp = FALSE,
+                   parallel = TRUE)
+```
+
+# Evaluation plots
+```{r evaluation plots}
+evalplot.stats(e = mod, stats = "or.mtp", color = "fc", x.var = "rm")
+evalplot.stats(e = mod, stats = c("or.mtp", "auc.val"), color = "fc", x.var = "rm")
+evalplot.stats(e = mod, stats = c("or.mtp", "auc.val"), color = "fc", x.var = "rm", 
+               error.bars = FALSE)
+```
+
+# Model selection
+```{r model selection}
+res <- eval.results(mod)
+opt.aicc <- res %>% dplyr::filter(delta.AICc == 0)
+opt.aicc
+mod.aicc <- eval.models(mod)[[opt.aicc$tune.args]]
+mod.aicc$betas
+plot(mod.aicc, type = "cloglog")
+
+pred.aicc <- eval.predictions(mod)[[opt.aicc$tune.args]]
+plot(pred.aicc)
+```
+
+# Get things ready for connectivity analysis
+```{r connectivity layers}
+HSM <- pred.aicc
+fence <- shapefile("data/FENCE/border_fence_all.shp")
+fence <- spTransform(fence, CRSobj = CRS("+init=epsg:3035"))
+fence <- gBuffer(fence, width = 250)
+HSM.inv <- spatialEco::raster.invert(HSM)
+```
+
+# Make binary map and filter patches
+```{r threshold HSM and filter patches}
+patchy <- HSM > 0.7
+plot(patchy)
+patchy <- patchy * grainscape::patchFilter(x = patchy, area = 5000000)
+plot(patchy)
+```
+
+# Create cost layer
+```{r cost layer}
+HSM.inv <- (HSM.inv*10)^2
+plot(HSM.inv)
+fence.rast <- rasterize(fence, patchy, field = 1000, background = NA)
+
+cost <- cover(fence.rast, HSM.inv)
+plot(cost)
+```
+
+# Crop layers to study area
+```{r crop to study area}
+study.area <- read_sf("study.area.shp")
+study.area.extent <- extent(as_Spatial(study.area))
+
+miniPatchy <- raster::crop(patchy, study.area.extent)
+miniCost <- raster::crop(cost, study.area.extent)
+```
+
+# Create MPG
+```{r mpg}
+patchyMPG <- MPG(cost = miniCost, patch = miniPatchy)
+plot(patchyMPG, quick = "mpgPlot", theme = FALSE) 
+```
